@@ -1,0 +1,35 @@
+[package]
+name = "file-dedupe"
+version = "0.1.0"
+edition = "2021"
+description = "Find and remove duplicate files by content hash (blake3), with size-bucketing for efficiency."
+license = "MIT"
+repository = "https://github.com/smolkapps/file-dedupe"
+readme = "README.md"
+keywords = ["deduplicate", "duplicate", "blake3", "hash", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "file-dedupe"
+path = "src/main.rs"
+
+[lib]
+name = "file_dedupe"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+walkdir = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
