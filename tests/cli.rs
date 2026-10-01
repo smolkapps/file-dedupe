@@ -174,3 +174,20 @@ fn clean_nonexistent_dir_errors() {
         .failure()
         .stderr(predicate::str::contains("does not exist"));
 }
+
+#[test]
+fn repeated_roots_never_delete_the_only_file_and_repeat_clean_is_safe() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("only.txt");
+    fs::write(&path, b"the only copy").unwrap();
+    for _ in 0..2 {
+        bin()
+            .arg("clean")
+            .arg(dir.path())
+            .arg(dir.path().join("."))
+            .args(["--keep", "first", "--commit"])
+            .assert()
+            .success();
+        assert_eq!(fs::read(&path).unwrap(), b"the only copy");
+    }
+}

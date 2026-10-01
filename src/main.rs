@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use file_dedupe::{
-    apply_action, find_duplicates, plan_clean, total_reclaimable, Action, CleanMode, DupGroup,
-    KeepPolicy, ScanOptions,
+    apply_action, find_duplicates, plan_clean, total_reclaimable, validate_actions, Action,
+    CleanMode, DupGroup, KeepPolicy, ScanOptions,
 };
 
 #[derive(Parser)]
@@ -250,6 +250,7 @@ fn cmd_clean(args: CleanArgs) -> Result<()> {
     // flag) leaves the filesystem untouched.
     let mut reclaimed = 0u64;
     if args.commit {
+        validate_actions(&actions).context("refusing unsafe cleanup actions")?;
         for a in &actions {
             reclaimed += apply_action(a)
                 .with_context(|| format!("failed to {verb} {}", a.path().display()))?;
