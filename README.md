@@ -23,8 +23,11 @@ cargo build --release
 file-dedupe scan DIR [DIR2 ...]
 ```
 
-Reports each group of byte-identical files and the total reclaimable bytes
+Reports each group of byte-identical files and the logical reclaimable bytes
 (the sum of every duplicate copy beyond the first in each group).
+This is an estimate based on file lengths, not a measurement of filesystem space
+freed; sparse files, compression, copy-on-write storage and existing links can
+change actual disk savings.
 
 Flags:
 
@@ -76,8 +79,14 @@ file-dedupe clean ~/Pictures --keep first --hardlink --commit
 `link`-then-`rename` inside an exclusively created private staging directory.
 Existing staging names are left alone; failed replacements clean up only this
 invocation's staging directory.
+Hardlinks share both content and inode metadata, including permissions, ownership
+and modification time. Editing either path changes the content seen through both.
 
 ## Safety guarantees
+
+Back up important files and inspect the dry-run plan before using `--commit`.
+See [RELEASE-USAGE.txt](RELEASE-USAGE.txt) for installation and a preview-first
+workflow using disposable fixture examples.
 
 - `clean` does nothing without `--commit`.
 - The kept file in a group is never deleted or replaced.

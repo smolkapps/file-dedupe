@@ -1,6 +1,6 @@
 [package]
 name = "file-dedupe"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Find and remove duplicate files by content hash (blake3), with size-bucketing for efficiency."
 license = "MIT"

@@ -1,0 +1,41 @@
+file-dedupe 0.1.1 — Linux x86_64
+
+Installation
+Download file-dedupe-linux-x86_64 and SHA256SUMS from the v0.1.1 GitHub release.
+Verify the downloaded binary before installing into an explicit directory:
+  sha256sum --check --ignore-missing SHA256SUMS
+  install -Dm755 file-dedupe-linux-x86_64 ./file-dedupe-bin/file-dedupe
+  ./file-dedupe-bin/file-dedupe --version
+
+The Linux executable requires the system libraries recorded in BUILD-INFO.txt.
+Other platforms have not been verified. To build the tagged source with Rust:
+  cargo build --release --locked -j1
+No package-registry publication is needed.
+
+Preview first
+Use a backed-up folder that no other process is changing. Scan and preview:
+  ./file-dedupe-bin/file-dedupe scan /path/to/selected-folder
+  ./file-dedupe-bin/file-dedupe clean /path/to/selected-folder --keep first
+These commands do not delete, move or replace files. Review each planned keeper
+and target before choosing to add --commit yourself. A new invocation rescans;
+the preview is not a saved, locked transaction.
+
+Disposable example
+Use a new temporary directory, not a real-data folder:
+  fixture=$(mktemp -d)
+  printf 'generated duplicate\n' > "$fixture/a.txt"
+  cp "$fixture/a.txt" "$fixture/b.txt"
+  printf 'generated unique\n' > "$fixture/unique.txt"
+  ./file-dedupe-bin/file-dedupe scan "$fixture" --json
+  ./file-dedupe-bin/file-dedupe clean "$fixture" --keep first
+The fixture is retained for inspection. This example is a dry run.
+
+Limits
+Deletion has no undo and the whole batch is not transactional: a later I/O error
+does not restore earlier deletions or replacements. Back up before committing.
+Hardlink mode shares file content and inode metadata such as permissions,
+ownership and modification times; changes through one name affect all linked
+names. Reported reclaimable bytes are logical estimates, not measured disk
+savings. Concurrent file/directory modification is unsupported. Identity checks
+reduce races but do not lock the filesystem. Non-Unix identity checks are weaker.
+Unreadable files may be skipped; inspect the scan output before committing.

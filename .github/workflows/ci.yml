@@ -10,4 +10,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo test
         working-directory: .
-        run: cargo test --workspace || cargo test
+        run: cargo test --locked --workspace -j1 -- --test-threads=1
