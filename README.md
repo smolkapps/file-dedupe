@@ -23,8 +23,11 @@ cargo build --release
 file-dedupe scan DIR [DIR2 ...]
 ```
 
-Reports each group of byte-identical files and the total reclaimable bytes
+Reports each group of byte-identical files and the logical reclaimable bytes
 (the sum of every duplicate copy beyond the first in each group).
+This is an estimate based on file lengths, not a measurement of filesystem space
+freed; sparse files, compression, copy-on-write storage and existing links can
+change actual disk savings.
 
 Flags:
 
@@ -73,16 +76,35 @@ file-dedupe clean ~/Pictures --keep first --hardlink --commit
 ```
 
 `--hardlink` swaps each duplicate for a hardlink to the kept file via an atomic
-`link`-then-`rename`, so a crash can never leave a path missing.
+`link`-then-`rename` inside an exclusively created private staging directory.
+Existing staging names are left alone; failed replacements clean up only this
+invocation's staging directory.
+Hardlinks share both content and inode metadata, including permissions, ownership
+and modification time. Editing either path changes the content seen through both.
 
 ## Safety guarantees
 
+Back up important files and inspect the dry-run plan before using `--commit`.
+See [RELEASE-USAGE.txt](RELEASE-USAGE.txt) for installation and a preview-first
+workflow using disposable fixture examples.
+
 - `clean` does nothing without `--commit`.
 - The kept file in a group is never deleted or replaced.
+- Repeated/overlapping roots and symlink aliases are scanned once using canonical
+  paths. On Unix, existing hardlinks are counted once per device/inode too.
+- Planning and commit validation refuse repeated targets or keeper identities.
+- Hardlink replacement refuses symlinks, non-regular files, and changed content.
 - Actions never cross a group boundary.
 - If a keeper can't be determined (e.g. a `newest`/`oldest` policy on files
   whose mtime can't be read), `clean` refuses rather than guessing.
 - Unreadable files are skipped, not fatal.
+
+Cleanup is not a transaction across the whole batch: a later I/O failure does
+not undo earlier deletions or replacements. Do not modify the tree concurrently
+while cleaning. Identity/content checks detect changes before replacement but
+cannot prevent another process changing a path between a check and a filesystem
+operation. Non-Unix builds use canonical path identity and do not detect distinct
+hardlink aliases.
 
 ## Library
 
@@ -96,9 +118,10 @@ let actions = plan_clean(&groups, KeepPolicy::First, CleanMode::Delete)?;
 ```
 
 `find_duplicates` does the size-bucket → pre-hash → full-hash pipeline.
-`plan_clean` is a pure function (no I/O) that turns groups + a policy into a list
-of `Action`s — it's the primary test surface. `main` is the only place that
-mutates the filesystem.
+`plan_clean` turns groups + a policy into a list of `Action`s and checks existing
+file identities without changing files. Library callers applying a batch should
+call `validate_actions` before applying any action. `apply_action` performs the
+filesystem mutation.
 
 ## License
 

@@ -5,15 +5,14 @@
 //!     size, then (cheaply) by a 4 KiB pre-hash, then confirm with a full
 //!     blake3 hash. Only files that share a full content hash end up in a
 //!     [`DupGroup`].
-//!   * [`plan_clean`] — a pure function that turns dup groups + a keep policy
-//!     into a list of [`Action`]s. It performs no I/O, which makes it the
-//!     primary, deterministic test surface. `main` is the only place that
-//!     actually mutates the filesystem.
+//!   * [`plan_clean`] — turns dup groups + a keep policy
+//!     into a list of [`Action`]s, refusing overlapping file identities.
+//!     [`validate_actions`] checks the entire batch before mutation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -141,11 +140,26 @@ pub enum CleanMode {
 pub fn find_duplicates(roots: &[PathBuf], opts: &ScanOptions) -> Vec<DupGroup> {
     // --- Step 1: bucket by size -------------------------------------------
     let mut by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
+    let mut seen = HashSet::new();
     for root in roots {
-        for entry in collect_files(root, opts) {
+        for mut entry in collect_files(root, opts) {
             if entry.size < opts.min_size {
                 continue;
             }
+            // Roots can overlap or refer to the same directory through aliases.
+            // Canonical paths also keep followed symlink aliases out of actions.
+            let path = match fs::canonicalize(&entry.path) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let identity = match file_identity(&path) {
+                Ok(identity) => identity,
+                Err(_) => continue,
+            };
+            if !seen.insert(identity) {
+                continue;
+            }
+            entry.path = path;
             by_size.entry(entry.size).or_default().push(entry);
         }
     }
@@ -211,7 +225,7 @@ pub fn total_reclaimable(groups: &[DupGroup]) -> u64 {
 }
 
 /// Turn duplicate groups into a flat list of actions given a keep policy and
-/// mode. Pure: performs no I/O and mutates nothing.
+/// mode. Validates existing file identities and mutates nothing.
 ///
 /// For each group exactly one [`Action::Keep`] is emitted (the keeper chosen by
 /// `policy`); every other member becomes a [`Action::Delete`] or
@@ -226,6 +240,31 @@ pub fn plan_clean(
     policy: KeepPolicy,
     mode: CleanMode,
 ) -> Result<Vec<Action>, String> {
+    let mut paths = HashSet::new();
+    let mut identities = HashSet::new();
+    for group in groups {
+        for path in &group.paths {
+            let normalized = fs::canonicalize(path).unwrap_or_else(|_| {
+                path.components()
+                    .filter(|c| !matches!(c, Component::CurDir))
+                    .collect::<PathBuf>()
+            });
+            if !paths.insert(normalized) {
+                return Err(format!(
+                    "repeated path in duplicate groups: {}",
+                    path.display()
+                ));
+            }
+            if let Ok(identity) = file_identity(path) {
+                if !identities.insert(identity) {
+                    return Err(format!(
+                        "repeated file identity in duplicate groups: {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
     let mut actions = Vec::new();
     for group in groups {
         let keeper = choose_keeper(group, policy)?;
@@ -249,6 +288,54 @@ pub fn plan_clean(
         }
     }
     Ok(actions)
+}
+
+/// Refuse overlapping targets or keeper identities before applying any action.
+/// Paths must still be regular files; symlink replacements are refused.
+pub fn validate_actions(actions: &[Action]) -> io::Result<()> {
+    let mut identities = HashSet::new();
+    let mut keepers = HashSet::new();
+    for action in actions {
+        regular_file(action.path())?;
+        let identity = file_identity(action.path())?;
+        if !identities.insert(identity.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "repeated action target or keeper identity: {}",
+                    action.path().display()
+                ),
+            ));
+        }
+        if matches!(action, Action::Keep { .. }) {
+            keepers.insert(identity);
+        }
+    }
+    for action in actions {
+        if let Action::Hardlink { keep, .. } = action {
+            if !keepers.contains(&file_identity(keep)?) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "hardlink keeper is not protected by this plan: {}",
+                        keep.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn regular_file(path: &Path) -> io::Result<fs::Metadata> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing non-regular file: {}", path.display()),
+        ));
+    }
+    Ok(meta)
 }
 
 /// Pick the index into `group.paths` of the file to keep under `policy`.
@@ -297,6 +384,7 @@ pub fn apply_action(action: &Action) -> io::Result<u64> {
     match action {
         Action::Keep { .. } => Ok(0),
         Action::Delete { path, reclaim } => {
+            regular_file(path)?;
             fs::remove_file(path)?;
             Ok(*reclaim)
         }
@@ -305,30 +393,46 @@ pub fn apply_action(action: &Action) -> io::Result<u64> {
             keep,
             reclaim,
         } => {
+            regular_file(path)?;
+            regular_file(keep)?;
             // Skip if already the same inode (idempotent / nothing to do).
             if same_inode(path, keep)? {
                 return Ok(0);
             }
-            let tmp = temp_sibling(path);
-            // Clean any stale temp from a previous crash.
-            let _ = fs::remove_file(&tmp);
+            let original_identity = file_identity(path)?;
+            let keeper_identity = file_identity(keep)?;
+            if full_hash(path)? != full_hash(keep)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to replace changed duplicate: {}", path.display()),
+                ));
+            }
+            // Exclusively reserve a private directory; existing staging names
+            // belong to somebody else and must never be removed.
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let staging = tempfile::Builder::new()
+                .prefix(".file-dedupe-")
+                .tempdir_in(parent)?;
+            let tmp = staging.path().join("link");
             fs::hard_link(keep, &tmp)?;
+            regular_file(path)?;
+            regular_file(keep)?;
+            if file_identity(path)? != original_identity
+                || file_identity(keep)? != keeper_identity
+                || full_hash(path)? != full_hash(&tmp)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("file identity changed while staging: {}", path.display()),
+                ));
+            }
             // Atomic replace.
             fs::rename(&tmp, path)?;
             Ok(*reclaim)
         }
-    }
-}
-
-/// Build a temp sibling path next to `path` for the atomic hardlink swap.
-fn temp_sibling(path: &Path) -> PathBuf {
-    let mut name = std::ffi::OsString::from(".file-dedupe-tmp-");
-    if let Some(fname) = path.file_name() {
-        name.push(fname);
-    }
-    match path.parent() {
-        Some(dir) => dir.join(name),
-        None => PathBuf::from(name),
     }
 }
 
@@ -395,18 +499,33 @@ fn full_hash(path: &Path) -> io::Result<String> {
 }
 
 #[cfg(unix)]
-fn same_inode(a: &Path, b: &Path) -> io::Result<bool> {
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
-    let ma = fs::metadata(a)?;
-    let mb = fs::metadata(b)?;
-    Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
+    let meta = fs::metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
 }
 
 #[cfg(not(unix))]
-fn same_inode(_a: &Path, _b: &Path) -> io::Result<bool> {
-    // Inode identity isn't portable; treat as "not the same" so we always
-    // perform the link+rename (still correct, just not skipped).
-    Ok(false)
+type FileIdentity = PathBuf;
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> io::Result<FileIdentity> {
+    fs::canonicalize(path)
+}
+
+#[cfg(unix)]
+fn same_inode(a: &Path, b: &Path) -> io::Result<bool> {
+    Ok(file_identity(a)? == file_identity(b)?)
+}
+
+#[cfg(not(unix))]
+fn same_inode(a: &Path, b: &Path) -> io::Result<bool> {
+    // Portable fallback protects aliases of the same path. Distinct hardlink
+    // identities are only detected by the Unix implementation above.
+    Ok(fs::canonicalize(a)? == fs::canonicalize(b)?)
 }
 
 #[cfg(test)]
@@ -419,6 +538,27 @@ mod tests {
             size,
             paths: paths.iter().map(PathBuf::from).collect(),
         }
+    }
+
+    #[test]
+    fn batch_validation_refuses_keeper_deletion_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let keeper = dir.path().join("keeper");
+        fs::write(&keeper, b"only copy").unwrap();
+        let actions = vec![
+            Action::Keep {
+                path: keeper.clone(),
+            },
+            Action::Delete {
+                path: dir.path().join("./keeper"),
+                reclaim: 9,
+            },
+        ];
+        assert_eq!(
+            validate_actions(&actions).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&keeper).unwrap(), b"only copy");
     }
 
     #[test]

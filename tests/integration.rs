@@ -384,3 +384,183 @@ extern "C" {
     fn utimes(path: *const std::os::raw::c_char, times: *const libc_timeval)
         -> std::os::raw::c_int;
 }
+
+#[test]
+fn overlapping_and_aliased_roots_do_not_inflate_groups() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("a.txt"), b"same bytes").unwrap();
+    fs::write(dir.path().join("sub/b.txt"), b"same bytes").unwrap();
+    let roots = vec![
+        dir.path().to_path_buf(),
+        dir.path().join("sub"),
+        dir.path().join("sub/.."),
+    ];
+    let groups = find_duplicates(&roots, &ScanOptions::default());
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].paths.len(), 2);
+    assert_eq!(total_reclaimable(&groups), 10);
+    for action in plan_clean(&groups, KeepPolicy::First, CleanMode::Delete).unwrap() {
+        apply_action(&action).unwrap();
+    }
+    assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"same bytes");
+    assert!(!dir.path().join("sub/b.txt").exists());
+    assert!(find_duplicates(&roots, &ScanOptions::default()).is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn scan_does_not_count_existing_hardlinks_as_reclaimable_copies() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, b"one data block").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+    assert!(find_duplicates(&[dir.path().to_path_buf()], &ScanOptions::default()).is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn symlink_root_alias_does_not_duplicate_a_file_identity() {
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("real");
+    let alias = dir.path().join("alias");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("only.txt"), b"only copy").unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let mut opts = ScanOptions::default();
+    opts.follow_symlinks = true;
+    assert!(find_duplicates(&[real, alias], &opts).is_empty());
+}
+
+#[test]
+fn planner_refuses_repeated_paths_before_emitting_keeper_deletion() {
+    for paths in [vec!["a", "a"], vec!["a", "./a"]] {
+        let group = DupGroup {
+            hash: "fixture".into(),
+            size: 10,
+            paths: paths.into_iter().map(PathBuf::from).collect(),
+        };
+        assert!(plan_clean(&[group], KeepPolicy::First, CleanMode::Delete).is_err());
+    }
+    let first = DupGroup {
+        hash: "one".into(),
+        size: 10,
+        paths: vec!["a".into(), "b".into()],
+    };
+    let second = DupGroup {
+        hash: "two".into(),
+        size: 10,
+        paths: vec!["c".into(), "a".into()],
+    };
+    assert!(plan_clean(&[first, second], KeepPolicy::First, CleanMode::Delete).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn hardlink_preserves_unrelated_legacy_staging_file_and_repeated_runs() {
+    let dir = TempDir::new().unwrap();
+    let keep = dir.path().join("a.txt");
+    let path = dir.path().join("b.txt");
+    let sentinel = dir.path().join(".file-dedupe-tmp-b.txt");
+    fs::write(&keep, b"duplicate").unwrap();
+    fs::write(&path, b"duplicate").unwrap();
+    fs::write(&sentinel, b"unrelated staging name").unwrap();
+    let action = Action::Hardlink {
+        path: path.clone(),
+        keep: keep.clone(),
+        reclaim: 9,
+    };
+    assert_eq!(apply_action(&action).unwrap(), 9);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"unrelated staging name");
+    assert_eq!(apply_action(&action).unwrap(), 0);
+    assert_eq!(inode(&keep), inode(&path));
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+    assert!(find_duplicates(&[dir.path().to_path_buf()], &ScanOptions::default()).is_empty());
+}
+
+#[test]
+fn hardlink_refuses_changed_content_without_replacing_it() {
+    let dir = TempDir::new().unwrap();
+    let keep = dir.path().join("a.txt");
+    let path = dir.path().join("b.txt");
+    fs::write(&keep, b"duplicate").unwrap();
+    fs::write(&path, b"new data!").unwrap();
+    let action = Action::Hardlink {
+        path: path.clone(),
+        keep: keep.clone(),
+        reclaim: 9,
+    };
+    assert!(apply_action(&action).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"new data!");
+    assert_eq!(fs::read(&keep).unwrap(), b"duplicate");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn hardlink_failure_preserves_destination_and_leaves_no_staging_file() {
+    let dir = TempDir::new().unwrap();
+    let keep = dir.path().join("a.txt");
+    let path = dir.path().join("b.txt");
+    fs::write(&keep, b"duplicate").unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("sentinel"), b"unrelated").unwrap();
+    let action = Action::Hardlink {
+        path: path.clone(),
+        keep: keep.clone(),
+        reclaim: 9,
+    };
+    assert!(apply_action(&action).is_err());
+    assert_eq!(fs::read(path.join("sentinel")).unwrap(), b"unrelated");
+    assert_eq!(fs::read(&keep).unwrap(), b"duplicate");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn planner_refuses_aliases_of_a_keeper_across_groups() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let c = dir.path().join("c");
+    let alias = dir.path().join("alias");
+    fs::write(&a, b"duplicate").unwrap();
+    fs::write(&b, b"duplicate").unwrap();
+    fs::write(&c, b"duplicate").unwrap();
+    fs::hard_link(&a, &alias).unwrap();
+    let one = DupGroup {
+        hash: "one".into(),
+        size: 9,
+        paths: vec![a, b],
+    };
+    let two = DupGroup {
+        hash: "two".into(),
+        size: 9,
+        paths: vec![c, alias],
+    };
+    assert!(plan_clean(&[one, two], KeepPolicy::First, CleanMode::Delete).is_err());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 4);
+}
+
+#[test]
+#[cfg(unix)]
+fn hardlink_refuses_a_symlink_destination_without_replacing_it() {
+    let dir = TempDir::new().unwrap();
+    let keep = dir.path().join("keep");
+    let original = dir.path().join("original");
+    let path = dir.path().join("alias");
+    fs::write(&keep, b"duplicate").unwrap();
+    fs::write(&original, b"duplicate").unwrap();
+    std::os::unix::fs::symlink(&original, &path).unwrap();
+    assert!(apply_action(&Action::Hardlink {
+        path: path.clone(),
+        keep,
+        reclaim: 9
+    })
+    .is_err());
+    assert!(fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(&original).unwrap(), b"duplicate");
+}
