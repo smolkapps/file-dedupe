@@ -10,10 +10,49 @@ never touched.
 
 ## Install
 
+Download `file-dedupe-linux-x86_64` and `SHA256SUMS` from the
+[v0.1.1 release](https://github.com/smolkapps/file-dedupe/releases/tag/v0.1.1)
+into a new directory, then:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS &&
+install -Dm755 file-dedupe-linux-x86_64 ./file-dedupe-bin/file-dedupe &&
+./file-dedupe-bin/file-dedupe --version
+```
+
+The supplied binary is GNU/Linux x86_64, tested with glibc 2.39, and uses GLIBC
+symbols through 2.34. Other platforms have not been verified; see the release's
+`BUILD-INFO.txt` for library requirements.
+
+Or build from source:
+
 ```sh
 cargo build --release
 # binary at target/release/file-dedupe
 ```
+
+## Try a preview
+
+After installing the downloaded binary above, create a disposable fixture and
+inspect its duplicate group and cleanup plan:
+
+```sh
+(
+  set -e
+  fixture=$(mktemp -d)
+  printf 'generated duplicate\n' > "$fixture/a.txt"
+  cp "$fixture/a.txt" "$fixture/b.txt"
+  printf 'generated unique\n' > "$fixture/unique.txt"
+  ./file-dedupe-bin/file-dedupe scan "$fixture" --json
+  ./file-dedupe-bin/file-dedupe clean "$fixture" --keep first
+  printf 'Fixture retained at %s\n' "$fixture"
+)
+```
+
+The scan reports one duplicate group. Cleanup prints `DRY RUN`, a keeper and
+one proposed deletion. Neither command changes files; the fixture is retained
+for inspection. Back up real files and read the [safety details](#safety-guarantees)
+before applying cleanup.
 
 ## Usage
 
